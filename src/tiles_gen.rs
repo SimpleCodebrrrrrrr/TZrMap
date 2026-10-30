@@ -1,6 +1,6 @@
-//! Генерация png-тайлов для карты (если пользователь не положил свои в tiles/).
+//! Генерация png-тайлов для карты (если пользователь не положил свои в img/).
 
-use image::{ImageBuffer, Rgb, RgbImage};
+use image::{ImageBuffer, Rgb, RgbImage, Rgba, RgbaImage};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -132,8 +132,9 @@ fn forest(seed: u64) -> RgbImage {
     img
 }
 
-/// Создаёт каталог `dir` и кладёт в него базовые png-тайлы для каждого грунта
-/// (только для тех файлов, которых ещё нет).
+/// Создаёт каталог `dir` и кладёт в него базовые png-тайлы для каждого грунта,
+/// а также заготовки строений с альфа-каналом (zavod/lab/tpk/dom) — только для
+/// тех файлов, которых ещё нет.
 pub fn ensure_tiles(dir: &Path) {
     std::fs::create_dir_all(dir).ok();
     let variants: [(Terrain, fn(u64) -> RgbImage); 6] = [
@@ -156,4 +157,109 @@ pub fn ensure_tiles(dir: &Path) {
             }
         }
     }
+    // заготовки строений (png с альфа-каналом, рисуются в четверти тайла)
+    let buildings = [
+        ("zavod", (150u8, 150, 160)),  // завод — серый корпус с трубой
+        ("lab", (240, 240, 245)),      // лаборатория — белый купол
+        ("tpk", (220, 40, 40)),        // ТПК — красная будка
+        ("dom", (180, 120, 70)),       // дом — коричневый коттедж
+    ];
+    for (name, color) in buildings {
+        let path = dir.join(format!("{}.png", name));
+        if !path.exists() {
+            let img = building_placeholder(name, color);
+            if image::DynamicImage::ImageRgba8(img)
+                .save_with_format(&path, image::ImageFormat::Png)
+                .is_err()
+            {
+                eprintln!("Не удалось записать {}", path.display());
+            }
+        }
+    }
+}
+
+/// Простая заготовка здания с прозрачным фоном (альфа-канал).
+fn building_placeholder(kind: &str, color: (u8, u8, u8)) -> RgbaImage {
+    let s = TILE;
+    let mut img = ImageBuffer::from_pixel(s, s, Rgba([0, 0, 0, 0]));
+    let dark = (
+        color.0.saturating_sub(50),
+        color.1.saturating_sub(50),
+        color.2.saturating_sub(50),
+    );
+    let px = |img: &mut RgbaImage, x: i32, y: i32, c: (u8, u8, u8)| {
+        if x >= 0 && y >= 0 && x < s as i32 && y < s as i32 {
+            img.put_pixel(x as u32, y as u32, Rgba([c.0, c.1, c.2, 255]));
+        }
+    };
+    match kind {
+        "zavod" => {
+            // корпус + две трубы
+            for x in 8..s as i32 - 8 {
+                for y in (s as i32 - 26)..(s as i32 - 8) {
+                    px(&mut img, x, y, color);
+                }
+            }
+            for cx in [14i32, 26, 38] {
+                for y in 6..(s as i32 - 26) {
+                    px(&mut img, cx, y, dark);
+                    px(&mut img, cx + 1, y, dark);
+                    px(&mut img, cx + 2, y, dark);
+                }
+            }
+        }
+        "lab" => {
+            // белый купол на основании
+            let cx = s as i32 / 2;
+            let cy = s as i32 - 14;
+            let r = 16i32;
+            for dy in -r..=0 {
+                for dx in -r..=r {
+                    if dx * dx + dy * dy <= r * r {
+                        px(&mut img, cx + dx, cy + dy, color);
+                    }
+                }
+            }
+            for x in (cx - r - 2)..(cx + r + 3) {
+                for y in cy..cy + 6 {
+                    px(&mut img, x, y, dark);
+                }
+            }
+        }
+        "tpk" => {
+            // будка с крышей
+            for x in 14..(s as i32 - 14) {
+                for y in 18..(s as i32 - 8) {
+                    px(&mut img, x, y, color);
+                }
+            }
+            for x in 10..(s as i32 - 10) {
+                for y in 12..18 {
+                    px(&mut img, x, y, dark);
+                }
+            }
+            // дверь
+            for x in ((s as i32 / 2) - 3)..((s as i32 / 2) + 3) {
+                for y in (s as i32 - 20)..(s as i32 - 8) {
+                    px(&mut img, x, y, (40, 40, 40));
+                }
+            }
+        }
+        _ => {
+            // дом: стены + треугольная крыша
+            for x in 12..(s as i32 - 12) {
+                for y in 28..(s as i32 - 8) {
+                    px(&mut img, x, y, color);
+                }
+            }
+            let apex_y = 10i32;
+            for y in apex_y..28 {
+                let half = ((y - apex_y) as f32 / (28 - apex_y) as f32 * 18.0) as i32;
+                for x in (s as i32 / 2 - half)..(s as i32 / 2 + half) {
+                    px(&mut img, x, y, dark);
+                }
+            }
+        }
+    }
+    img
 }

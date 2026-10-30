@@ -12,21 +12,25 @@
 //!             радиации и уровня монстров, 3 radiobutton (вид дорог),
 //!             6 чекбоксов (характеристики локации), combobox вида значка.
 //!  * Правая часть (растягивается): карта — тайловое поле, каждая клетка
-//!    отображается png-изображением из каталога `tiles/` (или заливкой по типу).
+//!    отображается png-изображением из каталога `img/` рядом с исполняемым
+//!    файлом (или заливкой по типу грунта).
+//!  * Характеристики локации «завод», «лаборатория», «ТПК», «дом» загружают
+//!    соответствующие png (с альфа-каналом) из того же каталога и размещают
+//!    их в углу тайла, занимая четверть его площади.
 
 mod terrain;
 mod tiles_gen;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::{cairo, gdk, gio, glib, pango};
+use gtk::cairo;
 use libadwaita::{self as adw, prelude::*};
 
-use terrain::{Terrain, TileCache, TilePos, WorldMap};
+use terrain::{Terrain, TilePos, WorldMap};
 
 /// Размер клетки основной карты в пикселях.
 const TILE_PX: i32 = 48;
@@ -34,6 +38,97 @@ const TILE_PX: i32 = 48;
 const MINIMAP_SIZE: i32 = 361;
 /// Ширина левой панели по умолчанию.
 const LEFT_WIDTH: i32 = 420;
+
+// ---------------------------------------------------------------------------
+// Кэш png-изображений, декодированных в cairo ImageSurface (ARGB32)
+// ---------------------------------------------------------------------------
+
+/// Ожидается `<dir>/<lon>_<lat>.png`, либо общий тайл `<dir>/<тип>.png`.
+fn tile_png_path(dir: &Path, pos: TilePos, terrain: Terrain) -> Option<PathBuf> {
+    let per_tile = dir.join(format!("{}_{}.png", pos.lon, pos.lat));
+    if per_tile.exists() {
+        return Some(per_tile);
+    }
+    let common = dir.join(format!("{}.png", terrain.tile_name()));
+    if common.exists() {
+        return Some(common);
+    }
+    None
+}
+
+#[derive(Default)]
+struct SurfaceCache {
+    surfaces: HashMap<String, Option<Rc<cairo::ImageSurface>>>,
+}
+
+impl SurfaceCache {
+    /// Поверхность для файла `path` (кэшируется по имени файла).
+    fn get(&mut self, dir: &Path, name: &str) -> Option<Rc<cairo::ImageSurface>> {
+        if !self.surfaces.contains_key(name) {
+            let loaded = load_png_surface(&dir.join(name)).map(Rc::new);
+            self.surfaces.insert(name.to_string(), loaded);
+        }
+        self.surfaces.get(name)?.clone()
+    }
+}
+
+/// Кэш png-тайлов грунтов (по типу) и png строений локаций (по имени файла).
+struct PngTileCache {
+    dir: PathBuf,
+    terrain_tiles: SurfaceCache,
+    buildings: RefCell<SurfaceCache>,
+}
+
+impl PngTileCache {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            terrain_tiles: SurfaceCache::default(),
+            buildings: RefCell::new(SurfaceCache::default()),
+        }
+    }
+
+    /// Возвращает cairo-поверхность с содержимым png-файла тайла (или None).
+    fn surface(&mut self, pos: TilePos, terrain: Terrain) -> Option<Rc<cairo::ImageSurface>> {
+        match tile_png_path(&self.dir, pos, terrain) {
+            Some(p) => {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                self.terrain_tiles.get(&self.dir.clone(), &name)
+            }
+            None => None,
+        }
+    }
+
+    /// Поверхность png-файла строения (`<dir>/<file>.png`), если он существует.
+    fn building(&self, file: &str) -> Option<Rc<cairo::ImageSurface>> {
+        self.buildings.borrow_mut().get(&self.dir, file)
+    }
+}
+
+/// Декодирует png-файл и копирует пиксели в cairo ImageSurface (ARGB32).
+fn load_png_surface(path: &Path) -> Option<cairo::ImageSurface> {
+    let img = image::open(path).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let stride = cairo::Format::ARgb32.stride_for_width(w).ok()?;
+    let len = (stride * h as i32) as usize;
+    let mut buf = vec![0u8; len];
+    for y in 0..h as usize {
+        let row = &mut buf[y * stride as usize..][..w as usize * 4];
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            let p = img.get_pixel(x as u32, y as u32).0;
+            let a = p[3] as u16;
+            // straight RGBA -> premultiplied BGRA (формат ARGB32 в cairo — little-endian BGRA)
+            px[0] = (p[2] as u16 * a / 255) as u8;
+            px[1] = (p[1] as u16 * a / 255) as u8;
+            px[2] = (p[0] as u16 * a / 255) as u8;
+            px[3] = p[3];
+        }
+    }
+    let surf =
+        cairo::ImageSurface::create_for_data(buf, cairo::Format::ARgb32, w as i32, h as i32, stride)
+            .ok()?;
+    Some(surf)
+}
 
 // ---------------------------------------------------------------------------
 // Данные выбранной локации
@@ -79,13 +174,38 @@ const MONSTERS: [&str; 10] = [
 
 const ROADS: [&str; 3] = ["Шоссе", "Грунтовая дорога", "Нет дорог"];
 
-const FEATURES: [&str; 6] = [
-    "Торговцы",
-    "Магазины",
-    "Квесты",
-    "Аномалии",
-    "Погодные аномалии",
-    "Подземелье",
+/// Характеристики локации. Для «завод/лаборатория/ТПК/дом» в каталоге img/
+/// ищется png с альфа-каналом (`file`), который рисуется в четверти тайла.
+struct Feature {
+    title: &'static str,
+    file: Option<&'static str>,
+}
+
+const FEATURES: [Feature; 6] = [
+    Feature {
+        title: "Завод",
+        file: Some("zavod"),
+    },
+    Feature {
+        title: "Лаборатория",
+        file: Some("lab"),
+    },
+    Feature {
+        title: "ТПК",
+        file: Some("tpk"),
+    },
+    Feature {
+        title: "Дом",
+        file: Some("dom"),
+    },
+    Feature {
+        title: "Аномалии",
+        file: None,
+    },
+    Feature {
+        title: "Подземелье",
+        file: None,
+    },
 ];
 
 const ICONS: [&str; 9] = [
@@ -108,7 +228,7 @@ type Hook = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
 struct AppState {
     map: RefCell<WorldMap>,
-    tile_cache: RefCell<TileCache>,
+    tile_cache: RefCell<PngTileCache>,
     selected: Cell<Option<(i32, i32)>>,
     locations: RefCell<HashMap<(i32, i32), LocData>>,
     minimap_area: gtk::DrawingArea,
@@ -119,6 +239,10 @@ struct AppState {
 }
 
 impl AppState {
+    fn areas(&self) -> (gtk::DrawingArea, gtk::DrawingArea) {
+        (self.minimap_area.clone(), self.main_area.clone())
+    }
+
     fn coords_text(&self) -> String {
         match self.selected.get() {
             Some((lon, lat)) => {
@@ -134,8 +258,9 @@ impl AppState {
 
     fn refresh(&self) {
         self.info_label.set_text(&self.coords_text());
-        self.minimap_area.queue_draw();
-        self.main_area.queue_draw();
+        let (minimap, main) = self.areas();
+        minimap.queue_draw();
+        main.queue_draw();
     }
 
     fn select(&self, lon: i32, lat: i32) {
@@ -158,7 +283,7 @@ fn run_hook(h: &Hook) {
 /// CheckButton с текстовой меткой (в GTK4 нет with_label — собираем вручную).
 fn check_button(label: &str) -> gtk::CheckButton {
     let c = gtk::CheckButton::new();
-    c.set_child(Some(&gtk::Label::new(Some(label))));
+    c.set_label(Some(label));
     c
 }
 
@@ -169,12 +294,14 @@ fn toggle_button(label: &str) -> gtk::ToggleButton {
     b
 }
 
-/// RadioButton в группе `group` с меткой.
-fn radio_button(group: Option<&gtk::RadioButton>, label: &str) -> gtk::RadioButton {
-    match group {
-        Some(g) => gtk::RadioButton::builder().label(label).group(g).build(),
-        None => gtk::RadioButton::builder().label(label).build(),
+/// «Radiobutton» в GTK4: CheckButton, сгруппированный через group() для
+/// взаимной исключительности (класс RadioButton удалён из GTK4).
+fn radio_button(group: Option<&gtk::CheckButton>, label: &str) -> gtk::CheckButton {
+    let c = gtk::CheckButton::builder().label(label).build();
+    if let Some(g) = group {
+        c.set_group(Some(g));
     }
+    c
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +322,7 @@ fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
             let scale = (w as f64) / 361.0;
             // фон (на случай щелей между пикселями)
             cr.set_source_rgb(0.5, 0.5, 0.5);
-            cr.paint();
+            let _ = cr.paint();
             for lat in -180..=180i32 {
                 for lon in -180..=180i32 {
                     let (r, g, b) = map.get(lon, lat).color();
@@ -206,7 +333,7 @@ fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
                         scale.ceil() + 0.5,
                         scale.ceil() + 0.5,
                     );
-                    cr.fill();
+                    let _ = cr.fill();
                 }
             }
             // рамка выбранной клетки
@@ -219,7 +346,7 @@ fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
                     scale + 2.0,
                     scale + 2.0,
                 );
-                cr.stroke();
+                let _ = cr.stroke();
             }
         });
     }
@@ -242,7 +369,8 @@ fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
     }
     area.add_controller(gesture);
 
-    let frame = gtk::Frame::new(Some(area));
+    let frame = gtk::Frame::new(None);
+    frame.set_child(Some(area));
     frame.set_label_widget(Some(&gtk::Label::new(Some("Мини-карта (−180 … 180)"))));
     frame.set_halign(gtk::Align::Center);
     frame.set_valign(gtk::Align::Start);
@@ -296,6 +424,8 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
     let app2 = app.clone();
     area.set_draw_func(move |_, cr: &cairo::Context, w, h| {
         let map = app2.map.borrow();
+        let locations = app2.locations.borrow();
+        let mut cache = app2.tile_cache.borrow_mut();
         let cols = (w / TILE_PX).clamp(1, 361);
         let rows = (h / TILE_PX).clamp(1, 361);
         for row in 0..rows {
@@ -306,24 +436,21 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
                 let x = (col * TILE_PX) as f64;
                 let y = (row * TILE_PX) as f64;
 
-                // png-картинка локации, если есть
-                let path = app2
-                    .tile_cache
-                    .borrow_mut()
-                    .tile_path(TilePos { lon, lat }, terrain)
-                    .map(|p| p.to_path_buf());
+                // png-картинка локации, если есть (каталог img/ рядом с запуском)
                 let mut drawn = false;
-                if let Some(p) = path {
-                    if let Ok(tex) = gdk::Texture::for_filename(&p) {
-                        cr.set_texture(&tex);
-                        cr.save();
+                if let Some(surf) = cache.surface(TilePos { lon, lat }, terrain) {
+                    let sw = surf.width();
+                    let sh = surf.height();
+                    if sw > 0 && sh > 0 {
+                        let _ = cr.save();
                         cr.translate(x, y);
                         cr.scale(
-                            TILE_PX as f64 / tex.width() as f64,
-                            TILE_PX as f64 / tex.height() as f64,
+                            TILE_PX as f64 / sw as f64,
+                            TILE_PX as f64 / sh as f64,
                         );
-                        cr.paint();
-                        cr.restore();
+                        cr.set_source_surface(&*surf, 0.0, 0.0).ok();
+                        cr.paint().ok();
+                        let _ = cr.restore();
                         drawn = true;
                     }
                 }
@@ -331,13 +458,43 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
                     let (r, g, b) = terrain.color();
                     cr.set_source_rgb(r as f64 / 255., g as f64 / 255., b as f64 / 255.);
                     cr.rectangle(x, y, TILE_PX as f64, TILE_PX as f64);
-                    cr.fill();
+                    let _ = cr.fill();
                 }
+
+                // строения локации: png с альфа-каналом в четверти тайла
+                if let Some(loc) = locations.get(&(lon, lat)) {
+                    let quarter = (TILE_PX as f64) / 2.0;
+                    let mut slot = 0usize; // угол тайла для следующего строения
+                    for fname in &loc.features {
+                        let file = match FEATURES.iter().find(|f| f.title == fname) {
+                            Some(f) => f.file,
+                            None => None,
+                        };
+                        let Some(base) = file else { continue };
+                        let Some(surf) = cache.building(base) else {
+                            continue;
+                        };
+                        let sw = surf.width().max(1);
+                        let sh = surf.height().max(1);
+                        // положение в углу тайла: 0 — левый верхний,
+                        // 1 — правый верхний, 2 — левый нижний, 3 — правый нижний
+                        let px = x + if slot % 2 == 0 { 0.0 } else { quarter };
+                        let py = y + if slot < 2 { 0.0 } else { quarter };
+                        let _ = cr.save();
+                        cr.translate(px, py);
+                        cr.scale(quarter / sw as f64, quarter / sh as f64);
+                        cr.set_source_surface(&*surf, 0.0, 0.0).ok();
+                        cr.paint().ok();
+                        let _ = cr.restore();
+                        slot = (slot + 1) % 4;
+                    }
+                }
+
                 // тонкая сетка тайлового поля
                 cr.set_source_rgba(0.0, 0.0, 0.0, 0.15);
                 cr.set_line_width(1.0);
                 cr.rectangle(x, y, TILE_PX as f64, TILE_PX as f64);
-                cr.stroke();
+                let _ = cr.stroke();
             }
         }
         // подсветка выбранной клетки
@@ -347,7 +504,7 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
             cr.set_source_rgba(1.0, 0.1, 0.1, 0.95);
             cr.set_line_width(3.0);
             cr.rectangle(x, y, TILE_PX as f64, TILE_PX as f64);
-            cr.stroke();
+            let _ = cr.stroke();
         }
     });
 
@@ -380,7 +537,7 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
     }
     area.add_controller(gesture);
 
-    let scroller = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
+    let scroller = gtk::ScrolledWindow::new();
     scroller.set_child(Some(area));
     scroller.set_hexpand(true);
     scroller.set_vexpand(true);
@@ -396,12 +553,12 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
 // ---------------------------------------------------------------------------
 
 fn make_comment_tab(app: &Rc<AppState>) -> gtk::Widget {
-    let scroll = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
+    let scroll = gtk::ScrolledWindow::new();
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroll.set_vexpand(true);
 
     let view = gtk::TextView::new();
-    view.set_wrap_mode(pango::WrapMode::WordChar);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
     view.set_left_margin(8);
     view.set_right_margin(8);
     view.set_top_margin(8);
@@ -418,8 +575,8 @@ fn make_comment_tab(app: &Rc<AppState>) -> gtk::Widget {
                 return;
             }
             let Some(key) = state.selected.get() else { return };
-            let text = buf.text(&buf.start_mark(), &buf.end_mark(), true);
-            state.locations.borrow_mut().entry(key).or_default().comment = text;
+            let text = buf.text(&buf.bounds().0, &buf.bounds().1, true);
+            state.locations.borrow_mut().entry(key).or_default().comment = text.to_string();
         }
     });
 
@@ -510,8 +667,8 @@ fn make_form_tab(app: &Rc<AppState>) -> gtk::Widget {
     let feat_checks: Vec<gtk::CheckButton> = FEATURES
         .iter()
         .enumerate()
-        .map(|(i, name)| {
-            let c = check_button(name);
+        .map(|(i, f)| {
+            let c = check_button(f.title);
             feat_grid.attach(&c, (i / 3) as i32, (i % 3) as i32, 1, 1);
             c
         })
@@ -523,7 +680,7 @@ fn make_form_tab(app: &Rc<AppState>) -> gtk::Widget {
     let icon_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     icon_box.append(&section_title_inline("Вид значка:"));
     let icon_model = gtk::StringList::new(&ICONS);
-    let icon_combo = gtk::DropDown::from_model(Some(&icon_model), 0);
+    let icon_combo = gtk::DropDown::builder().model(&icon_model).selected(0).build();
     icon_combo.set_hexpand(false);
     icon_box.append(&icon_combo);
     content.append(&icon_box);
@@ -559,7 +716,7 @@ fn make_form_tab(app: &Rc<AppState>) -> gtk::Widget {
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| feat[*i].is_active())
-                .map(|(_, f)| (*f).to_string())
+                .map(|(_, f)| f.title.to_string())
                 .collect();
             if let Some(s) = combo.selected_item().and_downcast::<gtk::StringObject>() {
                 d.icon = s.string().to_string();
@@ -571,18 +728,19 @@ fn make_form_tab(app: &Rc<AppState>) -> gtk::Widget {
         let save = do_save.clone();
         for w in mon_checks
             .iter()
-            .map(|x| x.as_widget())
-            .chain(feat_checks.iter().map(|x| x.as_widget()))
-            .chain(road_btns.iter().map(|x| x.as_widget()))
+            .map(|x| x.clone().upcast::<gtk::Widget>())
+            .chain(feat_checks.iter().map(|x| x.clone().upcast::<gtk::Widget>()))
+            .chain(road_btns.iter().map(|x| x.clone().upcast::<gtk::Widget>()))
         {
-            w.connect_notify(Some("active"), move |_, _| save());
+            let save = save.clone();
+            w.connect_notify_local(Some("active"), move |_, _| save());
         }
         let save = do_save.clone();
         rad_spin.connect_value_changed(move |_| save());
         let save = do_save.clone();
         lvl_spin.connect_value_changed(move |_| save());
         let save = do_save.clone();
-        icon_combo.connect_selected_items_notify(move |_| save());
+        icon_combo.connect_selected_item_notify(move |_| save());
     }
 
     // === Загрузка данных при выборе другой клетки ===
@@ -607,7 +765,7 @@ fn make_form_tab(app: &Rc<AppState>) -> gtk::Widget {
             b.set_active(i == data.road);
         }
         for (i, c) in feat_checks.iter().enumerate() {
-            c.set_active(data.features.contains(&FEATURES[i].to_string()));
+            c.set_active(data.features.contains(&FEATURES[i].title.to_string()));
         }
         let idx = ICONS
             .iter()
@@ -618,7 +776,7 @@ fn make_form_tab(app: &Rc<AppState>) -> gtk::Widget {
     });
     append_hook(&app.load_hook, hook);
 
-    let scroll = gtk::ScrolledWindow::new(gtk::Adjustment::NONE, gtk::Adjustment::NONE);
+    let scroll = gtk::ScrolledWindow::new();
     scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroll.set_child(Some(&content));
     scroll.upcast()
@@ -659,8 +817,9 @@ fn append_hook(slot: &Hook, extra: Box<dyn Fn()>) {
 // Сборка окна
 // ---------------------------------------------------------------------------
 
-fn build_ui(app: &Rc<AppState>) -> adw::ApplicationWindow {
-    let window = adw::ApplicationWindow::new();
+fn build_ui(state: &Rc<AppState>, app: &adw::Application) -> adw::ApplicationWindow {
+    let gtk_app = app.clone().upcast::<gtk::Application>();
+    let window = adw::ApplicationWindow::new(&gtk_app);
     window.set_title(Some("TZrMap — TimeZero:Reborn Map"));
     window.set_default_size(1280, 800);
 
@@ -677,82 +836,117 @@ fn build_ui(app: &Rc<AppState>) -> adw::ApplicationWindow {
     left.set_margin_end(6);
     left.set_margin_top(6);
     left.set_margin_bottom(6);
-    left.append(&setup_minimap(app));
+    left.append(&setup_minimap(state));
 
     let notebook = gtk::Notebook::new();
     notebook.set_vexpand(true);
     notebook.append_page(
-        &make_comment_tab(app),
+        &make_comment_tab(state),
         Some(&gtk::Label::new(Some("Комментарий"))),
     );
     notebook.append_page(
-        &make_form_tab(app),
+        &make_form_tab(state),
         Some(&gtk::Label::new(Some("Локация"))),
     );
     left.append(&notebook);
     paned.set_start_child(Some(&left));
 
     // ---- Правая часть: карта ----
-    paned.set_end_child(Some(&setup_main_map(app)));
+    paned.set_end_child(Some(&setup_main_map(state)));
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&paned);
-    root.append(&app.info_label);
+    root.append(&state.info_label);
 
     window.set_content(Some(&root));
 
     // первичная загрузка формы/комментария
-    run_hook(&app.load_hook);
+    run_hook(&state.load_hook);
 
     window
 }
 
-fn main() {
-    adw::init().expect("Не удалось инициализировать libadwaita");
+/// Каталог `img/` рядом с исполняемым файлом (рядом с файлом запуска).
+fn img_dir() -> PathBuf {
+    let exe_parent = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("img")));
+    let chosen = match exe_parent {
+        Some(ref p) if p.is_dir() => p.clone(),
+        _ => PathBuf::from("img"),
+    };
+    std::fs::create_dir_all(&chosen).ok();
+    chosen
+}
 
-    // каталог с png-тайлами локаций; базовые картинки создаются автоматически
-    let tiles_dir = std::env::var("TZRMAP_TILES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join("tiles")
-        });
-    tiles_gen::ensure_tiles(&tiles_dir);
-
-    let info_label = gtk::Label::new(Some(""));
-    info_label.set_margin_start(8);
-    info_label.set_margin_end(8);
-    info_label.set_margin_top(4);
-    info_label.set_margin_bottom(4);
-    info_label.set_halign(gtk::Align::Start);
-
-    let app = Rc::new(AppState {
+fn make_state(tiles_dir: PathBuf) -> Rc<AppState> {
+    let mut initial_locs: HashMap<(i32, i32), LocData> = HashMap::new();
+    // демонстрационная локация: включены все 4 строения (png с альфа-каналом)
+    initial_locs.insert(
+        (0, 0),
+        LocData {
+            comment: "Демонстрационная локация".into(),
+            features: FEATURES[..4].iter().map(|f| f.title.to_string()).collect(),
+            ..LocData::default()
+        },
+    );
+    let state = Rc::new(AppState {
         map: RefCell::new(WorldMap::new()),
-        tile_cache: RefCell::new(TileCache::new(&tiles_dir)),
+        tile_cache: RefCell::new(PngTileCache::new(tiles_dir)),
         selected: Cell::new(None),
-        locations: RefCell::new(HashMap::new()),
+        locations: RefCell::new(initial_locs),
         minimap_area: gtk::DrawingArea::new(),
         main_area: gtk::DrawingArea::new(),
-        info_label,
+        info_label: gtk::Label::default(),
         load_hook: Rc::new(RefCell::new(None)),
     });
-
-    let window = build_ui(&app);
-
-    // простой событийный цикл без GtkApplication: завершаем работу при закрытии окна
-    let running = Rc::new(Cell::new(true));
+    // отступы нижней информационной строки (создаём уже после инициализации GTK,
+    // но параметры применим и здесь — Label ещё не «привязан» к дисплею)
     {
-        let running = running.clone();
-        window.connect_close_requested(move |_| {
-            running.set(false);
-            glib::Propagation::Proceed
-        });
+        let l = &state.info_label;
+        l.set_margin_start(8);
+        l.set_margin_end(8);
+        l.set_margin_top(4);
+        l.set_margin_bottom(4);
+        l.set_halign(gtk::Align::Start);
     }
-    window.present();
 
-    let ctx = glib::MainContext::default();
-    while running.get() {
-        ctx.iteration(true);
+    state
+}
+
+/// Отрисовать карту в cairo surface и сохранить png (для проверки без дисплея).
+#[cfg(feature = "headless-shot")]
+fn headless_shot(state: &Rc<AppState>, path: &Path) {
+    let w = 1280;
+    let h = 800;
+    let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
+    let cr = cairo::Context::new(&surf).unwrap();
+    // имитируем draw_func основной карты на весь экран
+    {
+        let area = &state.main_area;
+        // вызываем сохранённый draw func нельзя напрямую — рисуем свою копию логики:
+        // проще — дёрнем queue_draw невозможно без main context; поэтому повторяем код через helper
+        let _ = area;
+        draw_main_map_into(state, &cr, w, h);
     }
+    let mut file = std::fs::File::create(path).unwrap();
+    surf.write_to_png(&mut file).unwrap();
+}
+
+fn main() {
+    let application = adw::Application::builder()
+        .application_id("org.tzrmap.TZrMap")
+        .build();
+
+    application.connect_activate(|app| {
+        // каталог img/ рядом с исполняемым файлом; базовые картинки
+        // создаются автоматически, если пользователь не положил свои
+        let tiles_dir = img_dir();
+        tiles_gen::ensure_tiles(&tiles_dir);
+        let state = make_state(tiles_dir);
+        let window = build_ui(&state, app);
+        window.present();
+    });
+
+    application.run();
 }
