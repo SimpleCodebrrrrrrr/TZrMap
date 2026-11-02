@@ -1,7 +1,5 @@
 //! Типы грунта и генерация карты.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 /// Тип грунта тайла карты.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,41 +70,6 @@ impl Terrain {
 pub struct TilePos {
     pub lon: i32,
     pub lat: i32,
-}
-
-/// Кэш загруженных png-изображений тайлов по типу грунта.
-pub struct TileCache {
-    dir: PathBuf,
-    tiles: HashMap<Terrain, Option<PathBuf>>,
-}
-
-impl TileCache {
-    pub fn new(dir: &Path) -> Self {
-        Self {
-            dir: dir.to_path_buf(),
-            tiles: HashMap::new(),
-        }
-    }
-
-    /// Путь к png-файлу тайла, если файл существует на диске.
-    /// Ожидается `<dir>/<lon>_<lat>.png`, либо общий тайл `<dir>/<тип>.png`.
-    pub fn tile_path(&mut self, pos: TilePos, terrain: Terrain) -> Option<&Path> {
-        if !self.tiles.contains_key(&terrain) {
-            let per_tile = self
-                .dir
-                .join(format!("{}_{}.png", pos.lon, pos.lat));
-            let common = self.dir.join(format!("{}.png", terrain.tile_name()));
-            let found = if per_tile.exists() {
-                Some(per_tile)
-            } else if common.exists() {
-                Some(common)
-            } else {
-                None
-            };
-            self.tiles.insert(terrain, found);
-        }
-        self.tiles.get(&terrain)?.as_deref()
-    }
 }
 
 /// Карта: координаты от -180 до 180 включительно (361x361 пикселей/тайлов).
