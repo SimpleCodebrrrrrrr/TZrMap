@@ -1,6 +1,5 @@
 //! Типы грунта и генерация карты.
 
-
 /// Тип грунта тайла карты.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Terrain {
@@ -31,12 +30,12 @@ impl Terrain {
     /// Цвет для отрисовки на мини-карте (RGB).
     pub fn color(&self) -> (u8, u8, u8) {
         match self {
-            Terrain::Water => (30, 100, 200),    // синий
-            Terrain::Sand => (235, 160, 60),     // оранжевый
-            Terrain::Mountain => (120, 80, 50),  // коричневый
-            Terrain::Snow => (245, 245, 250),    // белый
-            Terrain::Field => (110, 190, 80),    // зелёный (поля)
-            Terrain::Forest => (25, 95, 40),     // тёмно-зелёный (лес)
+            Terrain::Water => (30, 100, 200),   // синий
+            Terrain::Sand => (235, 160, 60),    // оранжевый
+            Terrain::Mountain => (120, 80, 50), // коричневый
+            Terrain::Snow => (245, 245, 250),   // белый
+            Terrain::Field => (110, 190, 80),   // зелёный (поля)
+            Terrain::Forest => (25, 95, 40),    // тёмно-зелёный (лес)
         }
     }
 

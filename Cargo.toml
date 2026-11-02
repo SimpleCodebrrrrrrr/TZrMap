@@ -9,3 +9,7 @@ libadwaita = { package = "libadwaita", version = "0.9.2" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.10.3"
 rand_chacha = "0.10.0"
+
+[features]
+tools = ["headless-shot"]
+headless-shot = []
