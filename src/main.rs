@@ -226,6 +226,17 @@ const ICONS: [&str; 9] = [
 
 type Hook = Rc<RefCell<Option<Box<dyn Fn()>>>>;
 
+/// Область тайлов, видимая в окне основной карты (в глобальных координатах
+/// −180…180). Обновляется при прокрутке/изменении размеров и рисуется
+/// красной рамкой на мини-карте.
+#[derive(Clone, Copy, PartialEq)]
+struct ViewRect {
+    lon0: f64,
+    lat1: f64, // северная (верхняя) граница
+    lon1: f64,
+    lat0: f64, // южная (нижняя) граница
+}
+
 struct AppState {
     map: RefCell<WorldMap>,
     tile_cache: RefCell<PngTileCache>,
@@ -233,7 +244,10 @@ struct AppState {
     locations: RefCell<HashMap<(i32, i32), LocData>>,
     minimap_area: gtk::DrawingArea,
     main_area: gtk::DrawingArea,
+    scroller: gtk::ScrolledWindow,
     info_label: gtk::Label,
+    /// видимая область основной карты (для рамки на мини-карте)
+    view_rect: Cell<Option<ViewRect>>,
     /// вызывается при смене выбранной клетки — обновляет обе вкладки
     load_hook: Hook,
 }
@@ -258,9 +272,37 @@ impl AppState {
 
     fn refresh(&self) {
         self.info_label.set_text(&self.coords_text());
+        self.update_view_rect();
         let (minimap, main) = self.areas();
         minimap.queue_draw();
         main.queue_draw();
+    }
+
+    /// Пересчитывает видимую область основной карты по текущей прокрутке
+    /// и размерам ScrolledWindow (используется для рамки на мини-карте).
+    fn update_view_rect(&self) {
+        let (Some(hadj), Some(vadj)) = (self.scroller.hadjustment(), self.scroller.vadjustment())
+        else { return };
+        let w = self.scroller.width();
+        let h = self.scroller.height();
+        if w <= 0 || h <= 0 {
+            self.view_rect.set(None);
+            return;
+        }
+        let lon0 = -180.0 + hadj.value() / TILE_PX as f64;
+        let lon1 = -180.0 + (hadj.value() + w as f64) / TILE_PX as f64;
+        let lat_top = 180.0 - vadj.value() / TILE_PX as f64;
+        let lat_bottom = 180.0 - (vadj.value() + h as f64) / TILE_PX as f64;
+        let new = ViewRect {
+            lon0,
+            lat1: lat_top,
+            lon1,
+            lat0: lat_bottom,
+        };
+        if self.view_rect.get() != Some(new) {
+            self.view_rect.set(Some(new));
+            self.minimap_area.queue_draw();
+        }
     }
 
     fn select(&self, lon: i32, lat: i32) {
@@ -271,6 +313,25 @@ impl AppState {
             }
         }
         self.refresh();
+    }
+
+    /// Прокручивает основную карту так, чтобы выбранная клетка была в центре.
+    fn center_main_on_selection(&self) {
+        let Some((lon, lat)) = self.selected.get() else {
+            return;
+        };
+        let (Some(hadj), Some(vadj)) = (self.scroller.hadjustment(), self.scroller.vadjustment())
+        else { return };
+        let w = self.scroller.width();
+        let h = self.scroller.height();
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let cx = ((lon + 180) as f64 + 0.5) * TILE_PX as f64;
+        let cy = ((180 - lat) as f64 + 0.5) * TILE_PX as f64;
+        let _ = hadj.set_value((cx - w as f64 / 2.0).clamp(0.0, hadj.upper() - hadj.page_size()));
+        let _ = vadj.set_value((cy - h as f64 / 2.0).clamp(0.0, vadj.upper() - vadj.page_size()));
+        // hadj/vadj value-changed → update_view_rect → перерисовка мини-карты
     }
 }
 
@@ -308,6 +369,9 @@ fn radio_button(group: Option<&gtk::CheckButton>, label: &str) -> gtk::CheckButt
 // Мини-карта (левая верхняя половина)
 // ---------------------------------------------------------------------------
 
+/// Отступ слева/сверху под «линейки» координат основной карты, пиксели.
+const RULER_PX: i32 = 40;
+
 fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
     let area = &app.minimap_area;
     area.set_content_width(MINIMAP_SIZE);
@@ -336,16 +400,27 @@ fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
                     let _ = cr.fill();
                 }
             }
-            // рамка выбранной клетки
+            // рамка видимой области основной карты (красная)
+            if let Some(vr) = app2.view_rect.get() {
+                cr.set_source_rgba(1.0, 0.05, 0.05, 0.95);
+                cr.set_line_width(1.5);
+                let x0 = ((vr.lon0.max(-180.0) + 180.0) * scale).clamp(0.0, w as f64);
+                let x1 = ((vr.lon1.min(180.0) + 180.0) * scale).clamp(0.0, w as f64);
+                let y_top = ((180.0 - vr.lat1.max(-180.0)) * scale).clamp(0.0, w as f64);
+                let y_bot = ((180.0 - vr.lat0.min(180.0)) * scale).clamp(0.0, w as f64);
+                cr.rectangle(x0, y_top, (x1 - x0).max(1.0), (y_bot - y_top).max(1.0));
+                let _ = cr.stroke();
+            }
+            // метка выбранной локации (фиолетовый крест)
             if let Some((lon, lat)) = app2.selected.get() {
-                cr.set_source_rgba(1.0, 0.1, 0.1, 1.0);
-                cr.set_line_width(2.0);
-                cr.rectangle(
-                    (lon + 180) as f64 * scale - 1.0,
-                    (180 - lat) as f64 * scale - 1.0,
-                    scale + 2.0,
-                    scale + 2.0,
-                );
+                cr.set_source_rgba(0.75, 0.2, 0.95, 1.0);
+                cr.set_line_width(1.0);
+                let cx = (lon + 180) as f64 * scale + scale / 2.0;
+                let cy = (180 - lat) as f64 * scale + scale / 2.0;
+                let _ = cr.move_to(cx - 4.0, cy);
+                let _ = cr.line_to(cx + 4.0, cy);
+                let _ = cr.move_to(cx, cy - 4.0);
+                let _ = cr.line_to(cx, cy + 4.0);
                 let _ = cr.stroke();
             }
         });
@@ -354,6 +429,15 @@ fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
     // клик по мини-карте выбирает локацию
     let gesture = gtk::GestureDrag::new();
     {
+        let app2 = app.clone();
+        let area3 = area.clone();
+        gesture.connect_drag_begin({
+            let app2 = app.clone();
+            move |_, _, _| {
+                // сразу центрируем основную карту на выбранной клетке
+                app2.center_main_on_selection();
+            }
+        });
         let app2 = app.clone();
         let area3 = area.clone();
         gesture.connect_drag_update(move |_, x, y| {
@@ -365,6 +449,8 @@ fn setup_minimap(app: &Rc<AppState>) -> gtk::Widget {
             let lon = ((x / scale) as i32 - 180).clamp(-180, 180);
             let lat = (180 - (y / scale) as i32).clamp(-180, 180);
             app2.select(lon, lat);
+            // перемещение по мини-карте — следим за курсором основной картой
+            app2.center_main_on_selection();
         });
     }
     area.add_controller(gesture);
@@ -386,6 +472,9 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
     area.set_hexpand(true);
     area.set_vexpand(true);
     area.set_can_focus(true);
+    // область рисования больше окна: слева и сверху — «линейки» координат
+    area.set_content_width(RULER_PX + 361 * TILE_PX);
+    area.set_content_height(RULER_PX + 361 * TILE_PX);
 
     // Палитра грунтов для «рисования»
     let palette = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -426,15 +515,25 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
         let map = app2.map.borrow();
         let locations = app2.locations.borrow();
         let mut cache = app2.tile_cache.borrow_mut();
-        let cols = (w / TILE_PX).clamp(1, 361);
-        let rows = (h / TILE_PX).clamp(1, 361);
+        // тайловое поле смещено на RULER_PX вправо/вниз — линейки координат
+        // проходят по левому краю и верхней кромке; отсечём всё вне поля
+        let _ = cr.save();
+        let _ = cr.rectangle(
+            RULER_PX as f64,
+            RULER_PX as f64,
+            (w - RULER_PX) as f64,
+            (h - RULER_PX) as f64,
+        );
+        let _ = cr.clip();
+        let cols = ((w - RULER_PX) / TILE_PX).clamp(1, 361);
+        let rows = ((h - RULER_PX) / TILE_PX).clamp(1, 361);
         for row in 0..rows {
             for col in 0..cols {
                 let lon = -180 + col;
                 let lat = 180 - row;
                 let terrain = map.get(lon, lat);
-                let x = (col * TILE_PX) as f64;
-                let y = (row * TILE_PX) as f64;
+                let x = (RULER_PX + col * TILE_PX) as f64;
+                let y = (RULER_PX + row * TILE_PX) as f64;
 
                 // png-картинка локации, если есть (каталог img/ рядом с запуском)
                 let mut drawn = false;
@@ -497,26 +596,79 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
                 let _ = cr.stroke();
             }
         }
-        // подсветка выбранной клетки
+        // подсветка выбранной локации — фиолетовая рамка (только на основной карте)
         if let Some((lon, lat)) = app2.selected.get() {
-            let x = ((lon + 180) * TILE_PX) as f64;
-            let y = ((180 - lat) * TILE_PX) as f64;
-            cr.set_source_rgba(1.0, 0.1, 0.1, 0.95);
+            let x = (RULER_PX + (lon + 180) * TILE_PX) as f64;
+            let y = (RULER_PX + (180 - lat) * TILE_PX) as f64;
+            cr.set_source_rgba(0.75, 0.2, 0.95, 0.95);
             cr.set_line_width(3.0);
             cr.rectangle(x, y, TILE_PX as f64, TILE_PX as f64);
             let _ = cr.stroke();
         }
+        let _ = cr.restore();
+
+        // ================= линейки координат (слева и сверху) =================
+        // фон линеек — полупрозрачный тёмный, чтобы белые цифры читались
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+        let _ = cr.rectangle(0.0, 0.0, w as f64, RULER_PX as f64);
+        let _ = cr.fill();
+        let _ = cr.rectangle(0.0, 0.0, RULER_PX as f64, h as f64);
+        let _ = cr.fill();
+
+        cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontSize::Normal);
+        cr.set_font_size(11.0);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.75); // белый, слегка прозрачный
+
+        // верхняя линейка: долготы (x), шаг 10°
+        for lon in (-180..=180i32).step_by(10) {
+            let px = (RULER_PX + (lon + 180) * TILE_PX) as f64;
+            if px > w as f64 {
+                break;
+            }
+            let _ = cr.move_to(px + 0.5, RULER_PX as f64 - 8.0);
+            let _ = cr.line_to(px + 0.5, RULER_PX as f64);
+            let _ = cr.stroke();
+            let text = format!("{lon}");
+            let ext = cr.text_extents(&text).unwrap_or_default();
+            let _ = cr.move_to(px - ext.width / 2.0, 14.0);
+            let _ = cr.show_text(&text);
+        }
+        // левая линейка: широты (y), шаг 10°
+        for lat in (-180..=180i32).step_by(10) {
+            let py = (RULER_PX + (180 - lat) * TILE_PX) as f64;
+            if py > h as f64 {
+                break;
+            }
+            let _ = cr.move_to(RULER_PX as f64 - 8.0, py + 0.5);
+            let _ = cr.line_to(RULER_PX as f64, py + 0.5);
+            let _ = cr.stroke();
+            let text = format!("{lat}");
+            let ext = cr.text_extents(&text).unwrap_or_default();
+            let _ = cr.move_to(
+                RULER_PX as f64 - 10.0 - ext.width,
+                py + ext.height / 2.0 - 1.0,
+            );
+            let _ = cr.show_text(&text);
+        }
+        // разделители линеек с полем
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.35);
+        let _ = cr.move_to(RULER_PX as f64 + 0.5, 0.0);
+        let _ = cr.line_to(RULER_PX as f64 + 0.5, h as f64);
+        let _ = cr.move_to(0.0, RULER_PX as f64 + 0.5);
+        let _ = cr.line_to(w as f64, RULER_PX as f64 + 0.5);
+        let _ = cr.stroke();
     });
 
-    // выбор клетки и рисование грунтом
+    // выбор клетки и рисование грунтом (координаты события — относительно
+    // области рисования; тайловое поле смещено на RULER_PX)
     let gesture = gtk::GestureDrag::new();
     {
         let app3 = app.clone();
         gesture.connect_drag_begin({
             let app4 = app.clone();
             move |_, x, y| {
-                let lon = (x as i32) / TILE_PX - 180;
-                let lat = 180 - (y as i32) / TILE_PX;
+                let lon = (x as i32 - RULER_PX) / TILE_PX - 180;
+                let lat = 180 - (y as i32 - RULER_PX) / TILE_PX;
                 if (-180..=180).contains(&lon) && (-180..=180).contains(&lat) {
                     app4.select(lon, lat);
                 }
@@ -524,8 +676,8 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
         });
         let pal = palette_sel.clone();
         gesture.connect_drag_update(move |_, x, y| {
-            let lon = (x as i32) / TILE_PX - 180;
-            let lat = 180 - (y as i32) / TILE_PX;
+            let lon = (x as i32 - RULER_PX) / TILE_PX - 180;
+            let lat = 180 - (y as i32 - RULER_PX) / TILE_PX;
             if (-180..=180).contains(&lon) && (-180..=180).contains(&lat) {
                 let t = Terrain::ALL[pal.get()];
                 if app3.map.borrow().get(lon, lat) != t {
@@ -537,14 +689,45 @@ fn setup_main_map(app: &Rc<AppState>) -> gtk::Widget {
     }
     area.add_controller(gesture);
 
-    let scroller = gtk::ScrolledWindow::new();
+    let scroller = &app.scroller;
     scroller.set_child(Some(area));
     scroller.set_hexpand(true);
     scroller.set_vexpand(true);
+    // при прокрутке/изменении размеров обновляем рамку видимой области на мини-карте
+    {
+        let app5 = app.clone();
+        if let Some(hadj) = scroller.hadjustment() {
+            hadj.connect_value_changed(move |_| app5.update_view_rect());
+        }
+        let app6 = app.clone();
+        if let Some(vadj) = scroller.vadjustment() {
+            vadj.connect_value_changed(move |_| app6.update_view_rect());
+        }
+        let app7 = app.clone();
+        scroller.connect_notify_local(Some("child"), move |_, _| app7.update_view_rect());
+    }
+
+    // изменение размера scroller — тоже пересчитываем видимую область
+    {
+        let app8 = app.clone();
+        let wch = area.connect_notify_local(Some("width"), move |_, _| app8.update_view_rect());
+        let app9 = app.clone();
+        let hch = area.connect_notify_local(Some("height"), move |_, _| app9.update_view_rect());
+        // не удерживать Rc<AppState> сильнее, чем живёт сама область
+        area.connect_destroy(move |a| {
+            a.disconnect(wch);
+            a.disconnect(hch);
+        });
+    }
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&palette);
-    vbox.append(&scroller);
+    vbox.append(scroller);
+    // после первого размещения пересчитаем рамку видимой области
+    {
+        let app10 = app.clone();
+        scroller.connect_map(move |_| app10.update_view_rect());
+    }
     vbox.upcast()
 }
 
@@ -897,7 +1080,9 @@ fn make_state(tiles_dir: PathBuf) -> Rc<AppState> {
         locations: RefCell::new(initial_locs),
         minimap_area: gtk::DrawingArea::new(),
         main_area: gtk::DrawingArea::new(),
+        scroller: gtk::ScrolledWindow::new(),
         info_label: gtk::Label::default(),
+        view_rect: Cell::new(None),
         load_hook: Rc::new(RefCell::new(None)),
     });
     // отступы нижней информационной строки (создаём уже после инициализации GTK,
@@ -921,16 +1106,148 @@ fn headless_shot(state: &Rc<AppState>, path: &Path) {
     let h = 800;
     let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).unwrap();
     let cr = cairo::Context::new(&surf).unwrap();
-    // имитируем draw_func основной карты на весь экран
-    {
-        let area = &state.main_area;
-        // вызываем сохранённый draw func нельзя напрямую — рисуем свою копию логики:
-        // проще — дёрнем queue_draw невозможно без main context; поэтому повторяем код через helper
-        let _ = area;
-        draw_main_map_into(state, &cr, w, h);
-    }
+    // рисуем мини-карту слева, основную карту — справа (в той же логике отрисовки,
+    // что и draw_func виджетов)
+    draw_minimap_into(state, &cr, MINIMAP_SIZE);
+    cr.save().unwrap();
+    cr.translate(MINIMAP_SIZE as f64 + 10.0, 0.0);
+    draw_main_map_into(state, &cr, w - MINIMAP_SIZE - 10, h);
+    let _ = cr.restore();
     let mut file = std::fs::File::create(path).unwrap();
     surf.write_to_png(&mut file).unwrap();
+}
+
+/// Копия логики draw_func мини-карты (для headless-проверки).
+#[cfg(feature = "headless-shot")]
+fn draw_minimap_into(app2: &Rc<AppState>, cr: &cairo::Context, w: i32) {
+    let map = app2.map.borrow();
+    let scale = (w as f64) / 361.0;
+    cr.set_source_rgb(0.5, 0.5, 0.5);
+    let _ = cr.paint();
+    for lat in -180..=180i32 {
+        for lon in -180..=180i32 {
+            let (r, g, b) = map.get(lon, lat).color();
+            cr.set_source_rgb(r as f64 / 255., g as f64 / 255., b as f64 / 255.);
+            cr.rectangle(
+                (lon + 180) as f64 * scale,
+                (180 - lat) as f64 * scale,
+                scale.ceil() + 0.5,
+                scale.ceil() + 0.5,
+            );
+            let _ = cr.fill();
+        }
+    }
+    if let Some(vr) = app2.view_rect.get() {
+        cr.set_source_rgba(1.0, 0.05, 0.05, 0.95);
+        cr.set_line_width(1.5);
+        let x0 = ((vr.lon0.max(-180.0) + 180.0) * scale).clamp(0.0, w as f64);
+        let x1 = ((vr.lon1.min(180.0) + 180.0) * scale).clamp(0.0, w as f64);
+        let y_top = ((180.0 - vr.lat1.max(-180.0)) * scale).clamp(0.0, w as f64);
+        let y_bot = ((180.0 - vr.lat0.min(180.0)) * scale).clamp(0.0, w as f64);
+        cr.rectangle(x0, y_top, (x1 - x0).max(1.0), (y_bot - y_top).max(1.0));
+        let _ = cr.stroke();
+    }
+    if let Some((lon, lat)) = app2.selected.get() {
+        cr.set_source_rgba(0.75, 0.2, 0.95, 1.0);
+        cr.set_line_width(1.0);
+        let cx = (lon + 180) as f64 * scale + scale / 2.0;
+        let cy = (180 - lat) as f64 * scale + scale / 2.0;
+        let _ = cr.move_to(cx - 4.0, cy);
+        let _ = cr.line_to(cx + 4.0, cy);
+        let _ = cr.move_to(cx, cy - 4.0);
+        let _ = cr.line_to(cx, cy + 4.0);
+        let _ = cr.stroke();
+    }
+}
+
+/// Копия логики draw_func основной карты (для headless-проверки).
+#[cfg(feature = "headless-shot")]
+fn draw_main_map_into(app2: &Rc<AppState>, cr: &cairo::Context, w: i32, h: i32) {
+    let map = app2.map.borrow();
+    let locations = app2.locations.borrow();
+    let mut cache = app2.tile_cache.borrow_mut();
+    let _ = cr.save();
+    let _ = cr.rectangle(
+        RULER_PX as f64,
+        RULER_PX as f64,
+        (w - RULER_PX) as f64,
+        (h - RULER_PX) as f64,
+    );
+    let _ = cr.clip();
+    let cols = ((w - RULER_PX) / TILE_PX).clamp(1, 361);
+    let rows = ((h - RULER_PX) / TILE_PX).clamp(1, 361);
+    for row in 0..rows {
+        for col in 0..cols {
+            let lon = -180 + col;
+            let lat = 180 - row;
+            let terrain = map.get(lon, lat);
+            let x = (RULER_PX + col * TILE_PX) as f64;
+            let y = (RULER_PX + row * TILE_PX) as f64;
+            let mut drawn = false;
+            if let Some(surf) = cache.surface(TilePos { lon, lat }, terrain) {
+                let sw = surf.width();
+                let sh = surf.height();
+                if sw > 0 && sh > 0 {
+                    let _ = cr.save();
+                    cr.translate(x, y);
+                    cr.scale(TILE_PX as f64 / sw as f64, TILE_PX as f64 / sh as f64);
+                    cr.set_source_surface(&*surf, 0.0, 0.0).ok();
+                    cr.paint().ok();
+                    let _ = cr.restore();
+                    drawn = true;
+                }
+            }
+            if !drawn {
+                let (r, g, b) = terrain.color();
+                cr.set_source_rgb(r as f64 / 255., g as f64 / 255., b as f64 / 255.);
+                cr.rectangle(x, y, TILE_PX as f64, TILE_PX as f64);
+                let _ = cr.fill();
+            }
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.15);
+            cr.set_line_width(1.0);
+            cr.rectangle(x, y, TILE_PX as f64, TILE_PX as f64);
+            let _ = cr.stroke();
+        }
+    }
+    if let Some((lon, lat)) = app2.selected.get() {
+        let x = (RULER_PX + (lon + 180) * TILE_PX) as f64;
+        let y = (RULER_PX + (180 - lat) * TILE_PX) as f64;
+        cr.set_source_rgba(0.75, 0.2, 0.95, 0.95);
+        cr.set_line_width(3.0);
+        cr.rectangle(x, y, TILE_PX as f64, TILE_PX as f64);
+        let _ = cr.stroke();
+    }
+    let _ = cr.restore();
+
+    // линейки координат
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+    let _ = cr.rectangle(0.0, 0.0, w as f64, RULER_PX as f64);
+    let _ = cr.fill();
+    let _ = cr.rectangle(0.0, 0.0, RULER_PX as f64, h as f64);
+    let _ = cr.fill();
+    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontSize::Normal);
+    cr.set_font_size(11.0);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.75);
+    for lon in (-180..=180i32).step_by(10) {
+        let px = (RULER_PX + (lon + 180) * TILE_PX) as f64;
+        if px > w as f64 {
+            break;
+        }
+        let text = format!("{lon}");
+        let ext = cr.text_extents(&text).unwrap_or_default();
+        let _ = cr.move_to(px - ext.width / 2.0, 14.0);
+        let _ = cr.show_text(&text);
+    }
+    for lat in (-180..=180i32).step_by(10) {
+        let py = (RULER_PX + (180 - lat) * TILE_PX) as f64;
+        if py > h as f64 {
+            break;
+        }
+        let text = format!("{lat}");
+        let ext = cr.text_extents(&text).unwrap_or_default();
+        let _ = cr.move_to(RULER_PX as f64 - 10.0 - ext.width, py + ext.height / 2.0 - 1.0);
+        let _ = cr.show_text(&text);
+    }
 }
 
 fn main() {
